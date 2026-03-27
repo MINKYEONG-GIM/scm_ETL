@@ -309,26 +309,66 @@ def save_to_supabase(run_info: Dict, monthly_df: pd.DataFrame, weekly_df: pd.Dat
     print("saved:", run_id)
 
 
+def chunked(seq: List[Dict], size: int):
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def bulk_insert_all(run_rows: List[Dict], monthly_rows: List[Dict], weekly_rows: List[Dict]):
+    if not run_rows:
+        return
+
+    # 1) run bulk insert
+    inserted_runs = []
+    for part in chunked(run_rows, 500):
+        res = supabase.table("sku_forecast_run").insert(part).execute()
+        if not res.data:
+            raise ValueError("sku_forecast_run bulk insert 실패")
+        inserted_runs.extend(res.data)
+
+    if len(inserted_runs) != len(run_rows):
+        raise ValueError("run insert 결과 개수가 요청 개수와 다릅니다.")
+
+    # 2) map processing index(1-based) -> run_id (insert order 기준)
+    temp_idx_to_run_id = {i + 1: inserted_runs[i]["id"] for i in range(len(inserted_runs))}
+
+    # 3) patch run_id and clear temp marker
+    fixed_monthly = []
+    for r in monthly_rows:
+        ridx = r.pop("_ridx")
+        run_id = temp_idx_to_run_id.get(ridx)
+        if run_id is None:
+            continue
+        r["forecast_run_id"] = run_id
+        fixed_monthly.append(r)
+
+    fixed_weekly = []
+    for r in weekly_rows:
+        ridx = r.pop("_ridx")
+        run_id = temp_idx_to_run_id.get(ridx)
+        if run_id is None:
+            continue
+        r["forecast_run_id"] = run_id
+        fixed_weekly.append(r)
+
+    # 4) monthly / weekly bulk insert
+    for part in chunked(fixed_monthly, 2000):
+        if part:
+            supabase.table("sku_monthly_forecast").insert(part).execute()
+    for part in chunked(fixed_weekly, 2000):
+        if part:
+            supabase.table("sku_weekly_forecast").insert(part).execute()
+
+
 def run_from_google_sheet(progress_bar=None, status_placeholder=None):
     sheets_cfg = dict(st.secrets["sheets"])
     sheet_id = sheets_cfg["sheet_id"]
     final_sheet = sheets_cfg.get("final_sheet", "final")
     plc_sheet = sheets_cfg.get("plc_sheet", "plc db")
-    center_stock_sheet = sheets_cfg.get("center_stock_sheet", "center_stock")
-    reorder_sheet = sheets_cfg.get("reorder_sheet", "reorder")
 
     sh = get_spreadsheet(sheet_id)
     final_df = load_sheet_as_df_from_spreadsheet(sh, final_sheet, fallback_first=False)
     plc_df = load_sheet_as_df_from_spreadsheet(sh, plc_sheet, fallback_first=False)
-    # optional sheets (for future extension)
-    try:
-        _center_stock_df = load_sheet_as_df_from_spreadsheet(sh, center_stock_sheet, fallback_first=False)
-    except Exception:
-        _center_stock_df = pd.DataFrame()
-    try:
-        _reorder_df = load_sheet_as_df_from_spreadsheet(sh, reorder_sheet, fallback_first=False)
-    except Exception:
-        _reorder_df = pd.DataFrame()
 
     if final_df.empty:
         raise ValueError(f"'{final_sheet}' 시트가 비어 있습니다.")
@@ -348,21 +388,22 @@ def run_from_google_sheet(progress_bar=None, status_placeholder=None):
     success = 0
     fail = 0
     logs = []
+    run_rows = []
+    monthly_rows_all = []
+    weekly_rows_all = []
 
     total = len(run_df)
     started_at = time.time()
-    for idx, run_row in run_df.iterrows():
+    for idx, (_, run_row) in enumerate(run_df.iterrows(), start=1):
         try:
             sku = normalize_value(run_row["sku"])
             if status_placeholder is not None:
                 elapsed = time.time() - started_at
-                done = idx + 1
+                done = idx
                 avg_sec = elapsed / done if done > 0 else 0.0
                 remain_sec = max(0.0, avg_sec * (total - done))
-                status_placeholder.info(
-                    f"진행 중: {done}/{total} - SKU {sku} | "
-                    f"경과 {int(elapsed)}초 | 예상 남은 {int(remain_sec)}초"
-                )
+                status_placeholder.write(f"{done}/{total} 처리 중: {sku}")
+                st.caption(f"경과 {int(elapsed)}초 | 예상 남은 {int(remain_sec)}초")
             sty = normalize_value(run_row["style_code"])
             plant = normalize_value(run_row["plant"])
             item_code = normalize_value(run_row["item_code"])
@@ -389,14 +430,53 @@ def run_from_google_sheet(progress_bar=None, status_placeholder=None):
                 "season_end_week": None,
             }
 
-            weekly_fc["sku"] = sku
-            weekly_fc["sty"] = sty
-            weekly_fc["stage"] = None
-            monthly_fc["sku"] = sku
-            monthly_fc["sty"] = sty
-            monthly_fc["stage"] = None
+            run_rows.append(
+                {
+                    "SKU": normalize_value(run_info["sku"]),
+                    "style_code": normalize_value(run_info["style_code"]),
+                    "plant": normalize_value(run_info["plant"]),
+                    "shape_type": normalize_value(run_info["shape_type"]),
+                    "shape_reason": normalize_value(run_info["shape_reason"]),
+                    "peak_week": normalize_value(run_info["peak_week"]),
+                    "peak_month": normalize_value(run_info["peak_month"]),
+                    "season_start_week": normalize_value(run_info["season_start_week"]),
+                    "season_end_week": normalize_value(run_info["season_end_week"]),
+                }
+            )
 
-            save_to_supabase(run_info, monthly_fc, weekly_fc)
+            if not weekly_fc.empty:
+                weekly_fc["sku"] = sku
+                weekly_fc["sty"] = sty
+                weekly_fc["stage"] = None
+                for _, r in weekly_fc.iterrows():
+                    weekly_rows_all.append(
+                        {
+                            "_ridx": idx,
+                            "sku": normalize_value(r["sku"]),
+                            "sty": normalize_value(r["sty"]),
+                            "year_week": normalize_value(r["year_week"]),
+                            "forecast_qty": float(normalize_value(r["forecast_qty"]) or 0),
+                            "stage": normalize_value(r.get("stage")),
+                            "is_peak_week": bool(normalize_value(r.get("is_peak_week", False)) or False),
+                        }
+                    )
+
+            if not monthly_fc.empty:
+                monthly_fc["sku"] = sku
+                monthly_fc["sty"] = sty
+                monthly_fc["stage"] = None
+                for _, r in monthly_fc.iterrows():
+                    monthly_rows_all.append(
+                        {
+                            "_ridx": idx,
+                            "sku": normalize_value(r["sku"]),
+                            "sty": normalize_value(r["sty"]),
+                            "year_month": normalize_value(r["year_month"]),
+                            "forecast_qty": int(normalize_value(r["forecast_qty"]) or 0),
+                            "stage": normalize_value(r.get("stage")),
+                            "is_peak_month": bool(normalize_value(r.get("is_peak_month", False)) or False),
+                        }
+                    )
             success += 1
             logs.append({"sku": sku, "status": "success", "message": ""})
         except Exception as e:
@@ -404,7 +484,10 @@ def run_from_google_sheet(progress_bar=None, status_placeholder=None):
             logs.append({"sku": normalize_value(run_row.get("sku")), "status": "fail", "message": str(e)})
         finally:
             if progress_bar is not None and total > 0:
-                progress_bar.progress((idx + 1) / total)
+                progress_bar.progress(idx / total)
+
+    # 처리 완료 후 한 번에 bulk insert
+    bulk_insert_all(run_rows, monthly_rows_all, weekly_rows_all)
 
     return success, fail, pd.DataFrame(logs)
 
