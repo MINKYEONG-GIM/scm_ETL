@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import time
 from typing import Dict, List
 
 import gspread
@@ -309,7 +308,7 @@ def save_to_supabase(run_info: Dict, monthly_df: pd.DataFrame, weekly_df: pd.Dat
     print("saved:", run_id)
 
 
-def run_from_google_sheet(progress_bar=None, status_placeholder=None):
+def run_from_google_sheet():
     sheets_cfg = dict(st.secrets["sheets"])
     sheet_id = sheets_cfg["sheet_id"]
     final_sheet = sheets_cfg.get("final_sheet", "final")
@@ -349,20 +348,9 @@ def run_from_google_sheet(progress_bar=None, status_placeholder=None):
     fail = 0
     logs = []
 
-    total = len(run_df)
-    started_at = time.time()
-    for idx, run_row in run_df.iterrows():
+    for _, run_row in run_df.iterrows():
         try:
             sku = normalize_value(run_row["sku"])
-            if status_placeholder is not None:
-                elapsed = time.time() - started_at
-                done = idx + 1
-                avg_sec = elapsed / done if done > 0 else 0.0
-                remain_sec = max(0.0, avg_sec * (total - done))
-                status_placeholder.info(
-                    f"진행 중: {done}/{total} - SKU {sku} | "
-                    f"경과 {int(elapsed)}초 | 예상 남은 {int(remain_sec)}초"
-                )
             sty = normalize_value(run_row["style_code"])
             plant = normalize_value(run_row["plant"])
             item_code = normalize_value(run_row["item_code"])
@@ -402,9 +390,6 @@ def run_from_google_sheet(progress_bar=None, status_placeholder=None):
         except Exception as e:
             fail += 1
             logs.append({"sku": normalize_value(run_row.get("sku")), "status": "fail", "message": str(e)})
-        finally:
-            if progress_bar is not None and total > 0:
-                progress_bar.progress((idx + 1) / total)
 
     return success, fail, pd.DataFrame(logs)
 
@@ -415,20 +400,12 @@ def main():
     st.write("버튼을 누르면 시트 데이터를 읽어 3개 테이블에 저장합니다.")
 
     if st.button("실행하기", type="primary", use_container_width=True):
-        progress_bar = st.progress(0.0)
-        status_placeholder = st.empty()
         with st.spinner("구글 시트 읽는 중 / Supabase 저장 중..."):
             try:
-                success, fail, log_df = run_from_google_sheet(
-                    progress_bar=progress_bar,
-                    status_placeholder=status_placeholder,
-                )
-                progress_bar.progress(1.0)
-                status_placeholder.success("처리 완료")
+                success, fail, log_df = run_from_google_sheet()
                 st.success(f"완료: 성공 {success}건 / 실패 {fail}건")
                 st.dataframe(log_df, use_container_width=True, hide_index=True)
             except Exception as e:
-                status_placeholder.error("중단됨")
                 st.error(f"실행 실패: {e}")
 
 
