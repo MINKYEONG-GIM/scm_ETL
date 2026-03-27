@@ -1,0 +1,14 @@
+streamlit
+pandas
+plotly
+gspread
+google-auth
+numpy
+requests
+datetime
+scipy
+sqlalchemy
+psycopg2-binary
+pyodbc
+st-gsheets-connection
+supabase
