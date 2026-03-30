@@ -125,27 +125,24 @@ st.title("Google Sheets → Supabase 동기화")
 
 replace_all = st.checkbox("전체 삭제 후 재삽입(덮어쓰기)", value=True)
 
-tab_center_stock, tab_reorder = st.tabs(["center_stock", "reorder"])
+if st.button("전체 실행", type="primary"):
+    with st.spinner("center_stock 읽는 중..."):
+        df_center = read_center_stock()
+    st.subheader("center_stock")
+    st.dataframe(df_center.head(50), use_container_width=True)
+    st.caption(f"총 {len(df_center):,}행")
 
-with tab_center_stock:
-    if st.button("center_stock 실행", type="primary"):
-        with st.spinner("구글시트 읽는 중..."):
-            df = read_center_stock()
-        st.dataframe(df.head(50), use_container_width=True)
-        st.caption(f"총 {len(df):,}행")
+    with st.spinner("center_stock 적재 중..."):
+        inserted_center = sync_center_stock(replace_all=replace_all)
+    st.success(f"center_stock 완료: {inserted_center:,}행 적재")
 
-        with st.spinner("Supabase 적재 중..."):
-            inserted = sync_center_stock(replace_all=replace_all)
-        st.success(f"완료: {inserted:,}행 적재")
+    with st.spinner("reorder 읽는 중..."):
+        df_reorder = read_reorder()
+    st.subheader("reorder")
+    st.dataframe(df_reorder.head(50), use_container_width=True)
+    st.caption(f"총 {len(df_reorder):,}행")
 
-with tab_reorder:
-    if st.button("reorder 실행", type="primary"):
-        with st.spinner("구글시트 읽는 중..."):
-            df = read_reorder()
-        st.dataframe(df.head(50), use_container_width=True)
-        st.caption(f"총 {len(df):,}행")
-
-        with st.spinner("Supabase 적재 중..."):
-            inserted = sync_reorder(replace_all=replace_all)
-        st.success(f"완료: {inserted:,}행 적재")
+    with st.spinner("reorder 적재 중..."):
+        inserted_reorder = sync_reorder(replace_all=replace_all)
+    st.success(f"reorder 완료: {inserted_reorder:,}행 적재")
 
