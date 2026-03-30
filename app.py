@@ -1,8 +1,4 @@
-import json
-import os
-import re
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import gspread
 import pandas as pd
@@ -11,9 +7,17 @@ from google.oauth2.service_account import Credentials
 from supabase import create_client
 
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+REQUIRED_COLS = ["style_code", "sku", "center", "stock_qty"]
+
+
+def _auto_chunk_size(n_rows: int) -> int:
+    if n_rows <= 0:
+        return 100
+    if n_rows <= 100:
+        return n_rows
+    if n_rows <= 1000:
+        return 250
+    return 500
 
 
 def read_center_stock() -> pd.DataFrame:
@@ -46,9 +50,10 @@ def read_center_stock() -> pd.DataFrame:
     return df.where(pd.notnull(df), None)
 
 
-def sync_center_stock(replace_all: bool = True, chunk_size: int = 500) -> int:
+def sync_center_stock(replace_all: bool = True) -> int:
     supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     rows = read_center_stock().to_dict(orient="records")
+    chunk_size = _auto_chunk_size(len(rows))
 
     if replace_all:
         supabase.table("center_stock").delete().neq("id", -1).execute()
@@ -68,7 +73,6 @@ st.set_page_config(page_title="center_stock sync", layout="wide")
 st.title("center_stock 동기화 (Google Sheets → Supabase)")
 
 replace_all = st.checkbox("전체 삭제 후 재삽입(덮어쓰기)", value=True)
-chunk_size = st.number_input("배치 크기", min_value=50, max_value=2000, value=500, step=50)
 
 if st.button("실행", type="primary"):
     with st.spinner("구글시트 읽는 중..."):
@@ -77,7 +81,6 @@ if st.button("실행", type="primary"):
     st.caption(f"총 {len(df):,}행")
 
     with st.spinner("Supabase 적재 중..."):
-        inserted = sync_center_stock(replace_all=replace_all, chunk_size=int(chunk_size))
+        inserted = sync_center_stock(replace_all=replace_all)
     st.success(f"완료: {inserted:,}행 적재")
-
 
