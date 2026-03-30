@@ -219,7 +219,7 @@ def _clear_supabase_table_by_id_batches(table_name: str, batch_size: int = 500) 
 
 def _prepare_rows_for_insert(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Supabase 기본키/자동 시각은 시트에 없다고 가정하고 id 제외."""
-    skip = {"id"}
+    skip = {"id", "created_at"}
     cleaned: List[Dict[str, Any]] = []
     for r in records:
         row = {k: v for k, v in r.items() if k not in skip}
@@ -229,10 +229,22 @@ def _prepare_rows_for_insert(records: List[Dict[str, Any]]) -> List[Dict[str, An
 
 def _insert_supabase_batches(table_name: str, rows: List[Dict[str, Any]], chunk_size: int = 500) -> None:
     for i in range(0, len(rows), chunk_size):
-        part = rows[i : i + chunk_size]
+        part = rows[i:i + chunk_size]
         if not part:
             continue
-        supabase.table(table_name).insert(part).execute()
+
+        try:
+            supabase.table(table_name).insert(part).execute()
+        except Exception as e:
+            print(f"[BATCH ERR] table={table_name}, start_index={i}, error={e}")
+
+            for j, row in enumerate(part):
+                try:
+                    supabase.table(table_name).insert(row).execute()
+                except Exception as row_e:
+                    print(f"[ROW ERR] table={table_name}, row_index={i + j}, row={row}, error={row_e}")
+
+            raise RuntimeError(f"{table_name} insert 실패: {e}")
 
 
 def sync_google_sheets_to_supabase(
@@ -258,6 +270,12 @@ def sync_google_sheets_to_supabase(
             continue
         records = worksheet_to_records(ws)
         rows = _prepare_rows_for_insert(records)
+        log.append(f"[DEBUG] {table_name}: records={len(records)}")
+        if rows:
+            log.append(f"[DEBUG] {table_name}: columns={list(rows[0].keys())}")
+            log.append(f"[DEBUG] {table_name}: first_row={rows[0]}")
+        else:
+            log.append(f"[DEBUG] {table_name}: no rows to insert")
         if replace_existing:
             try:
                 _clear_supabase_table_by_id_batches(table_name)
@@ -611,12 +629,15 @@ def main():
             try:
                 msgs = sync_google_sheets_to_supabase(replace_existing=replace)
                 for line in msgs:
-                    st.text(line)
+                    if line.startswith("[ERR]") or line.startswith("[WARN]"):
+                        st.error(line)
+                    else:
+                        st.write(line)
                 st.success("동기화 요청을 마쳤습니다. 위 로그를 확인하세요.")
                 load_center_stock_df.clear()
                 load_reorder_df.clear()
             except Exception as e:
-                st.error(str(e))
+                st.error(f"동기화 전체 실패: {e}")
 
     try:
         runs_df = load_sku_forecast_run_df()
