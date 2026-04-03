@@ -601,6 +601,8 @@ def build_sku_weekly_forecast_rows(
     - is_forecast: 해당 행 ISO 주차가 오늘 기준 이번 주보다 뒤이면 True(예측 판매량), 이번 주·과거면 False
     - begin_stock: `apply_forecast_and_inventory_to_compare_table`까지 반영된 표의「기초재고」(주차별 롤링·클립과 동일)
     - loss: 동일 표의「로스」열과 동일(기초재고 계산 로직은 변경 없음)
+    - outbound_qty: 표의「출고량(회전 등)」(주차별, 해당 SKU·매장 조합의 compare_table_df 행)
+    - inbound_qty: 표의「분배량」(동일)
     - persist_compare_extras=True 이면 표의 작년 비중·기초재고(별칭)·분배·출고도 함께 넣습니다.
       (Supabase에 동일 이름 컬럼을 추가한 뒤 secrets에서 켜야 합니다.)
     - avg_discount_rate: final 시트 SALEAMT/SALEWHAN 기반 매장·SKU 할인율(동일 값을 모든 주차 행에 기록).
@@ -644,6 +646,8 @@ def build_sku_weekly_forecast_rows(
             "store_name": store_s,
             "begin_stock": as_supabase_int(row.get("기초재고")),
             "loss": as_supabase_int(row.get("로스")),
+            "outbound_qty": as_supabase_int(row.get("출고량(회전 등)")),
+            "inbound_qty": as_supabase_int(row.get("분배량")),
         }
         if avg_discount_rate is not None and pd.notna(avg_discount_rate):
             rec["avg_discount_rate"] = float(avg_discount_rate)
@@ -2494,8 +2498,8 @@ def main():
             "`sku_forecast_sku_column = \"sku\"` 로 맞추세요. (기본 컬럼명은 `SKU`)"
         )
         st.caption(
-            "`sku_weekly_forecast.begin_stock`·`loss`는 저장 시마다 채우며, "
-            "각각 화면 비교표의 기초재고·로스와 같습니다."
+            "`sku_weekly_forecast.begin_stock`·`loss`·`outbound_qty`·`inbound_qty`는 저장 시마다 채우며, "
+            "각각 화면 비교표의 기초재고·로스·출고량(회전 등)·분배량과 같습니다."
         )
         if extras_on:
             st.caption(
