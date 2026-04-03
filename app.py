@@ -90,6 +90,77 @@ def clean_number(value):
         return np.nan
 
 
+def attach_final_sheet_sale_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    final 시트에서 SALEAMT(판매금액)·SALEWHAN(정상가 환원 매출) 열을 찾아
+    내부용 `_saleamt`, `_salewhan` 숫자 컬럼을 붙입니다. 헤더에 부가 한글이 있어도 매칭됩니다.
+    """
+    saleamt_col = None
+    salewhan_col = None
+    for c in df.columns:
+        cs = str(c).upper()
+        if saleamt_col is None and "SALEAMT" in cs:
+            saleamt_col = c
+        if salewhan_col is None and "SALEWHAN" in cs:
+            salewhan_col = c
+    if saleamt_col is None and salewhan_col is None:
+        return df
+    df = df.copy()
+    if saleamt_col is not None:
+        df["_saleamt"] = df[saleamt_col].apply(clean_number)
+    if salewhan_col is not None:
+        df["_salewhan"] = df[salewhan_col].apply(clean_number)
+    return df
+
+
+def discount_rate_lookup_by_store_sku(prepared_final_df: pd.DataFrame) -> Dict[Tuple[str, str], float]:
+    """
+    매장(plant_name)·SKU별 할인율: 1 - sum(SALEAMT) / sum(SALEWHAN).
+    SALEWHAN 합이 0이면 해당 키는 제외합니다.
+    plant 저장값이 '전체'일 때 쓸 수 있도록, 동일 SKU의 전 매장 합산 비율을 ('전체', sku) 키로도 넣습니다.
+    """
+    df = prepared_final_df
+    if "_saleamt" not in df.columns or "_salewhan" not in df.columns:
+        return {}
+
+    tmp = df.dropna(subset=["sku"]).copy()
+    if tmp.empty:
+        return {}
+
+    tmp["plant_name"] = tmp["plant_name"].astype(str).str.strip().replace("", "전체")
+    tmp["sku"] = tmp["sku"].astype(str).str.strip()
+    tmp["_saleamt"] = pd.to_numeric(tmp["_saleamt"], errors="coerce").fillna(0.0)
+    tmp["_salewhan"] = pd.to_numeric(tmp["_salewhan"], errors="coerce")
+
+    out: Dict[Tuple[str, str], float] = {}
+
+    agg_store = (
+        tmp.groupby(["plant_name", "sku"], as_index=False)[["_saleamt", "_salewhan"]]
+        .sum()
+    )
+    for _, row in agg_store.iterrows():
+        sw, sa = row["_salewhan"], row["_saleamt"]
+        if pd.isna(sw) or float(sw) == 0.0:
+            continue
+        sku_k = str(row["sku"]).strip()
+        if not sku_k:
+            continue
+        plant_k = str(row["plant_name"]).strip() or "전체"
+        out[(plant_k, sku_k)] = 1.0 - (float(sa) / float(sw))
+
+    agg_all = tmp.groupby("sku", as_index=False)[["_saleamt", "_salewhan"]].sum()
+    for _, row in agg_all.iterrows():
+        sw, sa = row["_salewhan"], row["_saleamt"]
+        if pd.isna(sw) or float(sw) == 0.0:
+            continue
+        sku_k = str(row["sku"]).strip()
+        if not sku_k:
+            continue
+        out[("전체", sku_k)] = 1.0 - (float(sa) / float(sw))
+
+    return out
+
+
 def parse_yearweek_to_date(yearweek: str) -> pd.Timestamp:
     """
     '2025-01' 같은 값을 해당 ISO 주차의 월요일 날짜로 변환합니다.
@@ -517,6 +588,7 @@ def build_sku_weekly_forecast_rows(
     - forecast_qty: 화면의「올해 해당 주차 판매량 (장)」(실적 + 미래주 GPT 예측 반영값)
     - persist_compare_extras=True 이면 표의 작년 비중·기초재고·분배·출고·로스도 함께 넣습니다.
       (Supabase에 동일 이름 컬럼을 추가한 뒤 secrets에서 켜야 합니다.)
+    - avg_discount_rate: final 시트 SALEAMT/SALEWHAN 기반 매장·SKU 할인율(동일 값을 모든 주차 행에 기록).
     """
     rows: List[Dict[str, Any]] = []
     sty_s = str(sty).strip() if sty is not None else ""
@@ -547,8 +619,8 @@ def build_sku_weekly_forecast_rows(
             "sku_name": str(sku_name).strip(),
             "store_name": store_s,
         }
-        if avg_discount_rat is not None and pd.notna(avg_discount_rat):
-            rec["avg_discount_rat"] = float(avg_discount_rat)
+        if avg_discount_rate is not None and pd.notna(avg_discount_rate):
+            rec["avg_discount_rate"] = float(avg_discount_rate)
 
         if persist_compare_extras:
             rec["last_year_ratio_pct"] = float(
@@ -1704,8 +1776,9 @@ def prepare_final_df(final_df: pd.DataFrame) -> pd.DataFrame:
 
     이 함수는 어떤 구조가 들어와도 아래 "표준 컬럼"으로 정규화해서 반환합니다.
     표준 컬럼: sku, sku_name, style_code, 날짜, 판매량, plant_name, item_code (+ 선택: 기초재고, 분배량, 출고량(회전 등), 로스)
+    SALEAMT/SALEWHAN 열이 있으면 `_saleamt`, `_salewhan`이 함께 유지됩니다.
     """
-    df = final_df.copy()
+    df = attach_final_sheet_sale_columns(final_df.copy())
 
     # --------------------------
     # 1) 신버전(final DB) 감지
@@ -2010,6 +2083,7 @@ def main():
         return
 
     final_prepared = prepare_final_df(final_df)
+    discount_lookup = discount_rate_lookup_by_store_sku(final_prepared)
     options_df = get_final_item_options(final_prepared)
 
     if options_df.empty:
@@ -2183,6 +2257,8 @@ def main():
 
     plant_for_db = selected_plant if selected_plant != "전체" else "전체"
     store_for_db = plant_for_db
+    disc_key = (str(plant_for_db).strip(), str(selected_sku).strip())
+    avg_discount_for_sync = discount_lookup.get(disc_key)
 
     sb_client = get_supabase_client()
     extras_on = False
@@ -2234,7 +2310,7 @@ def main():
                     str(selected_row["style_code"]).strip(),
                     plant_for_db,
                     store_for_db,
-                    avg_discount_rat=None,
+                    avg_discount_rate=avg_discount_for_sync,
                     persist_compare_extras=extras_on,
                 )
                 sync_sku_weekly_forecast_to_supabase(sb_client, rows, selected_sku, plant_for_db)
@@ -2285,6 +2361,7 @@ def main():
                         skipped_notes.append(f"(빈 SKU) / {plant_db}")
                         continue
                     pf = plant_db if plant_db != "전체" else "전체"
+                    avg_disc_combo = discount_lookup.get((str(pf).strip(), str(sku_v).strip()))
                     built = build_compare_table_for_final_option(
                         plc_df,
                         final_prepared,
@@ -2310,7 +2387,7 @@ def main():
                         str(opt.get("style_code", "")).strip(),
                         pf,
                         plant_db if plant_db != "전체" else pf,
-                        avg_discount_rat=None,
+                        avg_discount_rate=avg_disc_combo,
                         persist_compare_extras=extras_on,
                     )
                     if not rows_part:
