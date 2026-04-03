@@ -580,12 +580,15 @@ def build_sku_weekly_forecast_rows(
     sty: str,
     plant: str,
     store_name: str,
-    avg_discount_rat: Optional[float] = None,
+    avg_discount_rate: Optional[float] = None,
     persist_compare_extras: bool = False,
+    current_week_no: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     화면 비교표(주차별)를 Supabase `sku_weekly_forecast` 테이블 컬럼에 맞게 변환합니다.
-    - forecast_qty: 화면의「올해 해당 주차 판매량 (장)」(실적 + 미래주 GPT 예측 반영값)
+    - sale_qty: 화면의「올해 해당 주차 판매량 (장)」(실적 + 미래주 GPT 예측 반영값)
+    - is_forecast: 해당 행 ISO 주차가 오늘 기준 이번 주보다 뒤이면 True(예측 판매량), 이번 주·과거면 False
+    - begin_stock: `apply_forecast_and_inventory_to_compare_table`까지 반영된 표의「기초재고」(주차별 롤링·클립과 동일)
     - persist_compare_extras=True 이면 표의 작년 비중·기초재고·분배·출고·로스도 함께 넣습니다.
       (Supabase에 동일 이름 컬럼을 추가한 뒤 secrets에서 켜야 합니다.)
     - avg_discount_rate: final 시트 SALEAMT/SALEWHAN 기반 매장·SKU 할인율(동일 값을 모든 주차 행에 기록).
@@ -595,6 +598,11 @@ def build_sku_weekly_forecast_rows(
     sku_s = str(sku).strip()
     plant_s = str(plant).strip() if plant else "전체"
     store_s = str(store_name).strip() if store_name else plant_s
+    cw = (
+        int(current_week_no)
+        if current_week_no is not None
+        else int(pd.Timestamp.today().isocalendar().week)
+    )
 
     for _, row in compare_table_df.iterrows():
         yw = str(row.get("주차", "")).strip()
@@ -604,13 +612,18 @@ def build_sku_weekly_forecast_rows(
         qty = row.get("올해 해당 주차 판매량 (장)", 0)
         qty_f = float(pd.to_numeric(qty, errors="coerce") or 0)
 
+        wn_raw = pd.to_numeric(row.get("week_no"), errors="coerce")
+        wn = int(wn_raw) if pd.notna(wn_raw) else None
+        is_forecast = bool(wn is not None and wn > cw)
+
         stage = str(row.get("예측 단계", "") or "").strip()
         peak_val = row.get("is_peak_week")
         peak = bool(peak_val) if pd.notna(peak_val) else False
 
         rec: Dict[str, Any] = {
             "year_week": yw,
-            "forecast_qty": qty_f,
+            "sale_qty": qty_f,
+            "is_forecast": is_forecast,
             "stage": stage,
             "sty": sty_s,
             "sku": sku_s,
@@ -618,6 +631,7 @@ def build_sku_weekly_forecast_rows(
             "plant": plant_s,
             "sku_name": str(sku_name).strip(),
             "store_name": store_s,
+            "begin_stock": float(pd.to_numeric(row.get("기초재고"), errors="coerce") or 0),
         }
         if avg_discount_rate is not None and pd.notna(avg_discount_rate):
             rec["avg_discount_rate"] = float(avg_discount_rate)
@@ -2312,6 +2326,7 @@ def main():
                     store_for_db,
                     avg_discount_rate=avg_discount_for_sync,
                     persist_compare_extras=extras_on,
+                    current_week_no=current_week_no,
                 )
                 sync_sku_weekly_forecast_to_supabase(sb_client, rows, selected_sku, plant_for_db)
                 pw, pm = peak_week_month_from_weekly_df(weekly_df)
@@ -2389,6 +2404,7 @@ def main():
                         plant_db if plant_db != "전체" else pf,
                         avg_discount_rate=avg_disc_combo,
                         persist_compare_extras=extras_on,
+                        current_week_no=current_week_no,
                     )
                     if not rows_part:
                         skipped_notes.append(f"{sku_v} / {plant_db} (저장할 행 없음)")
@@ -2469,6 +2485,9 @@ def main():
             "`sku_forecast_run` 저장 실패 시: **service_role_key** 권장(RLS 우회). RLS 유지 시 INSERT·DELETE·SELECT 정책 필요. "
             "`id`는 identity/bigserial 권장. API 오류에 컬럼명이 나오면 secrets에 "
             "`sku_forecast_sku_column = \"sku\"` 로 맞추세요. (기본 컬럼명은 `SKU`)"
+        )
+        st.caption(
+            "`sku_weekly_forecast.begin_stock`은 저장 시마다 채우며, 화면 비교표의 기초재고(주차별 롤링·예측 반영 후 값)와 같습니다."
         )
         if extras_on:
             st.caption(
