@@ -461,6 +461,47 @@ def get_supabase_client():
     return _create_supabase_client(url, key)
 
 
+def get_sku_forecast_run_sku_column_name() -> str:
+    """
+    sku_forecast_run 테이블의 SKU 컬럼 PostgREST 이름.
+    대시보드에 'SKU'로 보이면 API도 'SKU'인 경우가 많고, 소문자 'sku'인 경우도 있습니다.
+    secrets.toml [supabase] sku_forecast_sku_column = "sku" | "SKU"
+    환경변수 SUPABASE_SKU_FORECAST_SKU_COLUMN
+    """
+    try:
+        if hasattr(st, "secrets") and "supabase" in st.secrets:
+            v = st.secrets["supabase"].get("sku_forecast_sku_column")
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    except Exception:
+        pass
+    env_v = (os.getenv("SUPABASE_SKU_FORECAST_SKU_COLUMN") or "").strip()
+    if env_v:
+        return env_v
+    # Postgres 미인용 식별자는 소문자 저장 → PostgREST도 대개 `sku`. UI에만 SKU로 보일 수 있음.
+    return "sku"
+
+
+def omit_none_values(d: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in d.items() if v is not None}
+
+
+def sanitize_sku_forecast_run_row(rec: Dict[str, Any]) -> Dict[str, Any]:
+    """peak_week/month를 Python int로, None 값 제거."""
+    out: Dict[str, Any] = {}
+    for k, v in rec.items():
+        if v is None:
+            continue
+        if k in ("peak_week", "peak_month"):
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                continue
+        else:
+            out[k] = v
+    return out
+
+
 def build_sku_weekly_forecast_rows(
     compare_table_df: pd.DataFrame,
     sku: str,
@@ -582,13 +623,13 @@ def build_sku_forecast_run_payload(
     peak_month: Optional[int],
 ) -> Dict[str, Any]:
     """
-    Supabase 테이블 sku_forecast_run 행 1건.
-    대시보드에 SKU로 보여도 DB/API 컬럼은 보통 소문자 sku입니다.
+    Supabase sku_forecast_run 1건. SKU 컬럼 키는 get_sku_forecast_run_sku_column_name()와 동일해야 함.
     """
+    sk_col = get_sku_forecast_run_sku_column_name()
     sku_s = str(sku).strip()
     plant_s = str(plant).strip() if plant else "전체"
     rec: Dict[str, Any] = {
-        "sku": sku_s,
+        sk_col: sku_s,
         "sku_name": str(sku_name).strip(),
         "style_code": (str(style_code).strip() if style_code is not None else "") or None,
         "plant": plant_s,
@@ -597,7 +638,7 @@ def build_sku_forecast_run_payload(
         "peak_week": int(peak_week) if peak_week is not None else None,
         "peak_month": int(peak_month) if peak_month is not None else None,
     }
-    return rec
+    return omit_none_values(rec)
 
 
 def sync_sku_forecast_run_to_supabase(
@@ -606,17 +647,34 @@ def sync_sku_forecast_run_to_supabase(
     sku: str,
     plant: str,
 ) -> None:
-    """동일 SKU·plant의 sku_forecast_run 기존 행을 지우고 1건 삽입합니다."""
+    """
+    동일 SKU·plant 기존 행을 삭제한 뒤 1건 삽입합니다.
+    RLS 사용 시: anon 키로는 DELETE가 SELECT 정책에 막혀 0건만 지워질 수 있어 중복·실패가 납니다.
+    secrets에 service_role_key를 두는 것을 권장합니다.
+    """
     sku_s = str(sku).strip()
     plant_s = str(plant).strip() if plant else "전체"
+    sk_col = get_sku_forecast_run_sku_column_name()
+    clean = sanitize_sku_forecast_run_row(dict(payload))
     tbl = client.table("sku_forecast_run")
-    tbl.delete().eq("sku", sku_s).eq("plant", plant_s).execute()
-    tbl.insert(payload).execute()
+    try:
+        tbl.delete().eq(sk_col, sku_s).eq("plant", plant_s).execute()
+        if clean:
+            tbl.insert(clean).execute()
+    except Exception as e:
+        raise RuntimeError(
+            f"sku_forecast_run 저장 실패: {e!s}. "
+            f"확인: (1) service_role_key로 RLS 우회 "
+            f"(2) RLS 사용 시 sku_forecast_run에 INSERT·DELETE·SELECT 정책 "
+            f"(3) 컬럼명이 소문자 sku면 secrets에 sku_forecast_sku_column = \"sku\" "
+            f"(4) id에 identity/bigserial/default nextval 설정"
+        ) from e
 
 
 def clear_sku_forecast_run_table(client) -> None:
+    sk_col = get_sku_forecast_run_sku_column_name()
     sentinel = "\uffff\uffff__never_match_sku__\uffff\uffff"
-    client.table("sku_forecast_run").delete().neq("sku", sentinel).execute()
+    client.table("sku_forecast_run").delete().neq(sk_col, sentinel).execute()
 
 
 def bulk_insert_sku_forecast_run_rows(
@@ -628,7 +686,8 @@ def bulk_insert_sku_forecast_run_rows(
         return
     tbl = client.table("sku_forecast_run")
     for i in range(0, len(rows), batch_size):
-        tbl.insert(rows[i : i + batch_size]).execute()
+        chunk = [sanitize_sku_forecast_run_row(dict(r)) for r in rows[i : i + batch_size]]
+        tbl.insert(chunk).execute()
 
 
 def clear_sku_weekly_forecast_table(client) -> None:
@@ -2201,6 +2260,11 @@ def main():
             )
         else:
             st.success("Supabase 연결이 설정되어 있습니다. 표 위 **실행** 버튼으로 저장하세요.")
+        st.caption(
+            "`sku_forecast_run` 저장 실패 시: **service_role_key** 권장(RLS 우회). RLS 유지 시 INSERT·DELETE·SELECT 정책 필요. "
+            "`id`는 identity/bigserial 권장. API 오류에 컬럼명이 나오면 secrets에 "
+            "`sku_forecast_sku_column = \"SKU\"` 또는 `\"sku\"` 로 맞추세요. (기본 `sku`)"
+        )
         if extras_on:
             st.caption(
                 "확장 저장: `last_year_ratio_pct`, `beginning_inventory`, "
