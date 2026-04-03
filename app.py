@@ -90,6 +90,17 @@ def clean_number(value):
         return np.nan
 
 
+def as_supabase_int(value) -> int:
+    """
+    Supabase/Postgres `integer` 컬럼에 넣을 값.
+    Python float(0.0)이 JSON에 실수로 나가면 invalid input syntax for type integer: "0.0" 오류가 납니다.
+    """
+    x = pd.to_numeric(value, errors="coerce")
+    if pd.isna(x):
+        return 0
+    return int(round(float(x)))
+
+
 def attach_final_sheet_sale_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     final 시트에서 SALEAMT(판매금액)·SALEWHAN(정상가 환원 매출) 열을 찾아
@@ -610,7 +621,6 @@ def build_sku_weekly_forecast_rows(
             continue
 
         qty = row.get("올해 해당 주차 판매량 (장)", 0)
-        qty_f = float(pd.to_numeric(qty, errors="coerce") or 0)
 
         wn_raw = pd.to_numeric(row.get("week_no"), errors="coerce")
         wn = int(wn_raw) if pd.notna(wn_raw) else None
@@ -622,7 +632,7 @@ def build_sku_weekly_forecast_rows(
 
         rec: Dict[str, Any] = {
             "year_week": yw,
-            "sale_qty": qty_f,
+            "sale_qty": as_supabase_int(qty),
             "is_forecast": is_forecast,
             "stage": stage,
             "sty": sty_s,
@@ -631,7 +641,7 @@ def build_sku_weekly_forecast_rows(
             "plant": plant_s,
             "sku_name": str(sku_name).strip(),
             "store_name": store_s,
-            "begin_stock": float(pd.to_numeric(row.get("기초재고"), errors="coerce") or 0),
+            "begin_stock": as_supabase_int(row.get("기초재고")),
         }
         if avg_discount_rate is not None and pd.notna(avg_discount_rate):
             rec["avg_discount_rate"] = float(avg_discount_rate)
@@ -640,14 +650,10 @@ def build_sku_weekly_forecast_rows(
             rec["last_year_ratio_pct"] = float(
                 pd.to_numeric(row.get("작년의 해당 주차 판매비중(%)"), errors="coerce") or 0
             )
-            rec["beginning_inventory"] = float(
-                pd.to_numeric(row.get("기초재고"), errors="coerce") or 0
-            )
-            rec["distribution_qty"] = float(pd.to_numeric(row.get("분배량"), errors="coerce") or 0)
-            rec["shipment_qty"] = float(
-                pd.to_numeric(row.get("출고량(회전 등)"), errors="coerce") or 0
-            )
-            rec["loss"] = float(pd.to_numeric(row.get("로스"), errors="coerce") or 0)
+            rec["beginning_inventory"] = as_supabase_int(row.get("기초재고"))
+            rec["distribution_qty"] = as_supabase_int(row.get("분배량"))
+            rec["shipment_qty"] = as_supabase_int(row.get("출고량(회전 등)"))
+            rec["loss"] = as_supabase_int(row.get("로스"))
 
         rows.append(rec)
 
