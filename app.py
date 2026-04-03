@@ -690,6 +690,126 @@ def bulk_insert_sku_forecast_run_rows(
         tbl.insert(chunk).execute()
 
 
+# ----- Google Sheets → Supabase: center_stock, reorder -----
+CENTER_STOCK_COLS = ["style_code", "sku", "center", "stock_qty"]
+REORDER_COLS = ["style_code", "sku", "factory", "lead_time", "minimum_capacity"]
+
+
+def _auto_chunk_size(n_rows: int) -> int:
+    if n_rows <= 0:
+        return 100
+    if n_rows <= 100:
+        return n_rows
+    if n_rows <= 1000:
+        return 250
+    return 500
+
+
+def _df_to_supabase_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """NaN/NA → None, 정수 컬럼은 JSON용 int로."""
+    if df.empty:
+        return []
+    out: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        rec: Dict[str, Any] = {}
+        for col in df.columns:
+            val = row[col]
+            if pd.isna(val):
+                rec[col] = None
+            elif isinstance(val, (int, np.integer)):
+                rec[col] = int(val)
+            elif isinstance(val, (float, np.floating)):
+                if np.isnan(val):
+                    rec[col] = None
+                else:
+                    rec[col] = int(val) if float(val).is_integer() else float(val)
+            else:
+                rec[col] = val
+        out.append(rec)
+    return out
+
+
+def read_center_stock_supabase_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    ws_name = str(sheets_cfg.get("center_stock") or "center_stock").strip()
+    df = load_sheet_as_df(ws_name)
+    if df.empty:
+        return pd.DataFrame(columns=CENTER_STOCK_COLS)
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in CENTER_STOCK_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"center_stock 시트({ws_name!r}) 컬럼 누락: {missing} (필요: {CENTER_STOCK_COLS})"
+        )
+    df = df[CENTER_STOCK_COLS].copy()
+    df["style_code"] = df["style_code"].astype("string").str.strip()
+    df["sku"] = df["sku"].astype("string").str.strip()
+    df["center"] = df["center"].astype("string").str.strip()
+    df["stock_qty"] = pd.to_numeric(df["stock_qty"], errors="coerce").astype("Int64")
+    return df
+
+
+def read_reorder_supabase_df() -> pd.DataFrame:
+    sheets_cfg = get_sheets_config()
+    ws_name = str(sheets_cfg.get("reorder") or "reorder").strip()
+    df = load_sheet_as_df(ws_name)
+    if df.empty:
+        return pd.DataFrame(columns=REORDER_COLS)
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in REORDER_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"reorder 시트({ws_name!r}) 컬럼 누락: {missing} (필요: {REORDER_COLS})"
+        )
+    df = df[REORDER_COLS].copy()
+    df["style_code"] = df["style_code"].astype("string").str.strip()
+    df["sku"] = df["sku"].astype("string").str.strip()
+    df["factory"] = df["factory"].astype("string").str.strip()
+    df["lead_time"] = pd.to_numeric(df["lead_time"], errors="coerce").astype("Int64")
+    df["minimum_capacity"] = pd.to_numeric(df["minimum_capacity"], errors="coerce").astype("Int64")
+    return df
+
+
+def clear_center_stock_table(client) -> None:
+    sentinel = "\uffff\uffff__never_match_sku__\uffff\uffff"
+    client.table("center_stock").delete().neq("sku", sentinel).execute()
+
+
+def clear_reorder_table(client) -> None:
+    sentinel = "\uffff\uffff__never_match_sku__\uffff\uffff"
+    client.table("reorder").delete().neq("sku", sentinel).execute()
+
+
+def sync_center_stock_to_supabase(client, replace_all: bool = True) -> int:
+    df = read_center_stock_supabase_df()
+    records = _df_to_supabase_records(df)
+    chunk = _auto_chunk_size(len(records))
+    if replace_all:
+        clear_center_stock_table(client)
+    inserted = 0
+    for i in range(0, len(records), chunk):
+        batch = records[i : i + chunk]
+        if batch:
+            client.table("center_stock").insert(batch).execute()
+            inserted += len(batch)
+    return inserted
+
+
+def sync_reorder_to_supabase(client, replace_all: bool = True) -> int:
+    df = read_reorder_supabase_df()
+    records = _df_to_supabase_records(df)
+    chunk = _auto_chunk_size(len(records))
+    if replace_all:
+        clear_reorder_table(client)
+    inserted = 0
+    for i in range(0, len(records), chunk):
+        batch = records[i : i + chunk]
+        if batch:
+            client.table("reorder").insert(batch).execute()
+            inserted += len(batch)
+    return inserted
+
+
 def clear_sku_weekly_forecast_table(client) -> None:
     """
     sku_weekly_forecast 전체 비우기. PostgREST는 무조건 필터가 필요해
@@ -2080,7 +2200,7 @@ def main():
             type="primary",
             use_container_width=True,
             key="web_run_supabase_sync",
-            help="선택한 SKU·매장의 주차 표는 sku_weekly_forecast에, 형태(단봉형 등)·피크 주차/월은 sku_forecast_run에 저장됩니다.",
+            help="구글 시트 center_stock·reorder 전체를 각 테이블에 덮어쓴 뒤, 선택 SKU·매장의 sku_weekly_forecast·sku_forecast_run을 저장합니다.",
         )
     with sync_cols[1]:
         web_run_supabase_all = st.button(
@@ -2088,8 +2208,8 @@ def main():
             type="primary",
             use_container_width=True,
             key="web_run_supabase_sync_all",
-            help="final 시트 전 조합에 대해 sku_weekly_forecast와 sku_forecast_run을 비운 뒤 함께 채웁니다. "
-            "형태 분류는 로직만(OpenAI 없음). 미래 주차는 작년 비중 예측 규칙을 적용합니다.",
+            help="center_stock·reorder 시트를 Supabase에 덮어쓴 뒤, final 전 조합의 sku_weekly_forecast·sku_forecast_run을 채웁니다. "
+            "형태 분류는 로직만(OpenAI 없음).",
         )
 
     if web_run_supabase:
@@ -2105,6 +2225,8 @@ def main():
             )
         else:
             try:
+                n_center = sync_center_stock_to_supabase(sb_client, replace_all=True)
+                n_reorder = sync_reorder_to_supabase(sb_client, replace_all=True)
                 rows = build_sku_weekly_forecast_rows(
                     compare_table_df,
                     selected_sku,
@@ -2132,7 +2254,8 @@ def main():
                 )
                 st.session_state["supabase_sync_feedback"] = (
                     "success",
-                    f"실행 완료: sku_weekly_forecast {len(rows)}행 + sku_forecast_run 1건 "
+                    f"실행 완료: center_stock {n_center}행, reorder {n_reorder}행, "
+                    f"sku_weekly_forecast {len(rows)}행, sku_forecast_run 1건 "
                     f"(sku={selected_sku}, plant={plant_for_db}, 형태={shape_label}).",
                 )
             except Exception as e:
@@ -2212,6 +2335,8 @@ def main():
                 bulk_insert_sku_weekly_forecast_rows(sb_client, all_rows)
                 clear_sku_forecast_run_table(sb_client)
                 bulk_insert_sku_forecast_run_rows(sb_client, all_run_rows)
+                n_center = sync_center_stock_to_supabase(sb_client, replace_all=True)
+                n_reorder = sync_reorder_to_supabase(sb_client, replace_all=True)
                 st.session_state.pop("supabase_full_sync_skipped", None)
                 skip_tail = ""
                 if skipped_notes:
@@ -2223,7 +2348,8 @@ def main():
                 st.session_state["supabase_sync_feedback"] = (
                     "success",
                     f"일괄 저장 완료: sku_weekly_forecast {len(all_rows)}행, "
-                    f"sku_forecast_run {len(all_run_rows)}건, 조합 {success_combos}개 / 시트 후보 {len(options_df)}개.{skip_tail}",
+                    f"sku_forecast_run {len(all_run_rows)}건, center_stock {n_center}행, reorder {n_reorder}행, "
+                    f"조합 {success_combos}개 / 시트 후보 {len(options_df)}개.{skip_tail}",
                 )
             except Exception as e:
                 st.session_state["supabase_sync_feedback"] = ("error", f"일괄 저장 실패: {e}")
@@ -2242,12 +2368,14 @@ def main():
             for line in skipped_full:
                 st.text(line)
 
-    with st.expander("Supabase 저장 안내 (`sku_weekly_forecast` · `sku_forecast_run`)"):
+    with st.expander("Supabase 저장 안내 (4개 테이블)"):
         st.markdown(
-            "왼쪽 **실행**: 선택 SKU·매장의 주차별 표는 `sku_weekly_forecast`에, "
-            "그래프 형태(단봉형·쌍봉형·올시즌형 등)·판매 피크 ISO 주차·월은 `sku_forecast_run`에 각 1건 저장합니다. "
-            "같은 SKU·plant 조합은 두 테이블 모두에서 덮어씁니다. "
-            "오른쪽 **전체 시트 일괄 저장**은 final의 모든 조합에 대해 두 테이블을 **각각 비운 뒤** 다시 채웁니다."
+            "**실행**·**전체 시트 일괄 저장** 모두 다음을 갱신합니다. "
+            "`center_stock`(시트 키 `[sheets].center_stock`, 기본 워크시트명 `center_stock`), "
+            "`reorder`(`[sheets].reorder`) — 위 두 시트는 **전체 삭제 후** 시트 내용 그대로 재적재합니다. "
+            "필수 컬럼: center_stock → `style_code`,`sku`,`center`,`stock_qty` / reorder → "
+            "`style_code`,`sku`,`factory`,`lead_time`,`minimum_capacity`. "
+            "추가로 선택(또는 final 전 조합)에 대해 `sku_weekly_forecast`·`sku_forecast_run`을 저장합니다."
         )
         if _create_supabase_client is None:
             st.warning("패키지: `pip install supabase`")
