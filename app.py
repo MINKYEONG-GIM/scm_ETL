@@ -290,7 +290,11 @@ def forecast_with_gpt(
     forecast_df = pd.DataFrame({"날짜": forecast_dates, "forecast": forecast_values}).dropna(subset=["날짜"])
     return forecast_df
 
-def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
+def classify_shape(
+    item_name: str,
+    monthly_df: pd.DataFrame,
+    use_openai: bool = True,
+) -> Tuple[str, str]:
     if monthly_df.empty:
         return "판단불가", "월별 데이터가 없습니다."
 
@@ -301,6 +305,20 @@ def classify_shape(item_name: str, monthly_df: pd.DataFrame) -> Tuple[str, str]:
 
     y_smooth = smooth_series(y, window=2)
     month_labels = monthly_df["month"].dt.strftime("%Y-%m").tolist()
+
+    if not use_openai:
+        is_double, double_peaks = is_double_peak(y_smooth)
+        if is_double:
+            return "쌍봉형", f"로직 판별: 의미 있는 피크 2개 ({[month_labels[i] for i in double_peaks]})"
+
+        is_single, single_peaks = is_single_peak(y_smooth)
+        if is_single:
+            return "단봉형", f"로직 판별: 의미 있는 피크 1개 ({[month_labels[i] for i in single_peaks]})"
+
+        if is_all_season(y_smooth):
+            return "올시즌형", "로직 판별: 큰 피크 없이 전체적으로 고르게 분포"
+
+        return "단봉형", "로직 미확정으로 단봉형 fallback"
 
     prompt = f"""
 
@@ -526,6 +544,181 @@ def sync_sku_weekly_forecast_to_supabase(
         return
 
     tbl.insert(rows).execute()
+
+
+def clear_sku_weekly_forecast_table(client) -> None:
+    """
+    sku_weekly_forecast 전체 비우기. PostgREST는 무조건 필터가 필요해
+    존재할 수 없는 sku 값과의 neq로 전 행을 삭제합니다.
+    """
+    sentinel = "\uffff\uffff__never_match_sku__\uffff\uffff"
+    client.table("sku_weekly_forecast").delete().neq("sku", sentinel).execute()
+
+
+def bulk_insert_sku_weekly_forecast_rows(
+    client,
+    rows: List[Dict[str, Any]],
+    batch_size: int = 400,
+) -> None:
+    if not rows:
+        return
+    tbl = client.table("sku_weekly_forecast")
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i : i + batch_size]
+        tbl.insert(chunk).execute()
+
+
+def apply_forecast_and_inventory_to_compare_table(
+    compare_table_df: pd.DataFrame,
+    forecast_df: pd.DataFrame,
+    this_year: int,
+    current_week_no: int,
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """
+    단일 상품 화면과 동일 규칙으로 미래주 비중 예측·기초재고 롤링·로스를 반영합니다.
+    반환: (표, predict_mask, base_pred_mask, is_future_week) — 스타일 적용용.
+    """
+    compare_table_df = compare_table_df.copy()
+    compare_table_df = compare_table_df.sort_values("week_no", ascending=True, kind="mergesort").reset_index(drop=True)
+
+    forecast_week_map: Dict[int, int] = {}
+    if not forecast_df.empty and "날짜" in forecast_df.columns and "forecast" in forecast_df.columns:
+        tmp_fc = forecast_df.dropna(subset=["날짜"]).copy()
+        if not tmp_fc.empty:
+            tmp_fc["year"] = tmp_fc["날짜"].dt.isocalendar().year.astype(int)
+            tmp_fc = tmp_fc[tmp_fc["year"] == this_year].copy()
+            if not tmp_fc.empty:
+                tmp_fc["week_no"] = tmp_fc["날짜"].dt.isocalendar().week.astype(int)
+                tmp_fc["forecast"] = pd.to_numeric(tmp_fc["forecast"], errors="coerce").fillna(0)
+                forecast_week_map = (
+                    tmp_fc.groupby("week_no")["forecast"].sum().round().astype(int).to_dict()
+                )
+
+    is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
+    has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
+    predict_mask = is_future_week & has_forecast
+
+    if predict_mask.any():
+        compare_table_df.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = (
+            compare_table_df.loc[predict_mask, "week_no"].astype(int).map(forecast_week_map).fillna(0).astype(int)
+        )
+
+    for col in ["기초재고", "올해 해당 주차 판매량 (장)", "분배량", "출고량(회전 등)"]:
+        if col not in compare_table_df.columns:
+            compare_table_df[col] = 0
+        compare_table_df[col] = pd.to_numeric(compare_table_df[col], errors="coerce").fillna(0).astype(int)
+
+    base_pred_mask = pd.Series(False, index=compare_table_df.index)
+    week_list = compare_table_df["week_no"].astype(int).tolist()
+
+    for i in range(1, len(week_list)):
+        w_cur = int(week_list[i])
+        observed_base = int(compare_table_df.loc[i, "기초재고"])
+        if (w_cur <= current_week_no) and (observed_base != 0):
+            continue
+
+        prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
+        prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
+        prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
+        prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
+
+        predicted_base = prev_base - prev_sales + prev_dist - prev_ship
+        compare_table_df.loc[i, "기초재고"] = int(predicted_base)
+
+        if w_cur > current_week_no:
+            base_pred_mask.iloc[i] = True
+
+    sales_col = "올해 해당 주차 판매량 (장)"
+    base_raw = compare_table_df["기초재고"].astype(int).copy()
+    compare_table_df["기초재고"] = np.maximum(base_raw, 0).astype(int)
+
+    n_rows = len(compare_table_df)
+    loss_vals: List[int] = []
+    prev_loss = 0
+    for i in range(n_rows):
+        w = int(compare_table_df.loc[i, "week_no"])
+        if w <= current_week_no:
+            loss_vals.append(0)
+            continue
+
+        raw_b = int(base_raw.iloc[i])
+        sales = int(compare_table_df.loc[i, sales_col])
+        if raw_b <= 0:
+            cur_loss = prev_loss - sales
+        elif raw_b < sales:
+            cur_loss = raw_b - sales
+        else:
+            cur_loss = 0
+        prev_loss = cur_loss
+        loss_vals.append(cur_loss)
+    compare_table_df["로스"] = loss_vals
+
+    return compare_table_df, predict_mask, base_pred_mask, is_future_week
+
+
+def build_compare_table_for_final_option(
+    plc_df: pd.DataFrame,
+    final_prepared: pd.DataFrame,
+    *,
+    selected_sku: str,
+    selected_sku_name: str,
+    selected_item_code: str,
+    selected_plant: str,
+    this_year: int,
+    use_openai_shape: bool,
+    apply_ratio_forecast: bool,
+) -> Optional[pd.DataFrame]:
+    """
+    final 시트의 (매장, SKU) 한 조합에 대해 주차 비교표를 계산합니다.
+    plc db에 아이템코드가 없으면 None.
+    """
+    sku_key = str(selected_sku).strip()
+    plant_key = str(selected_plant).strip() if selected_plant else "전체"
+
+    final_item_df = final_prepared[final_prepared["sku"].astype(str).str.strip() == sku_key].copy()
+    if plant_key and plant_key != "전체":
+        final_item_df = final_item_df[
+            final_item_df["plant_name"].astype(str).str.strip() == plant_key
+        ].copy()
+
+    try:
+        item_name, weekly_df, monthly_df = prepare_plc_item_timeseries(
+            plc_df, str(selected_item_code).strip()
+        )
+    except ValueError:
+        return None
+
+    shape_label, _shape_reason = classify_shape(
+        item_name, monthly_df, use_openai=use_openai_shape
+    )
+    weekly_df = classify_weekly_stages_by_shape(weekly_df, shape_label)
+
+    compare_table_df = build_year_compare_table(
+        weekly_df=weekly_df,
+        final_item_df=final_item_df,
+        selected_sku=sku_key,
+        selected_sku_name=str(selected_sku_name).strip(),
+        week_label_year=this_year,
+    )
+
+    if apply_ratio_forecast:
+        try:
+            forecast_df = forecast_with_gpt(
+                item_name,
+                shape_label,
+                weekly_df,
+                final_item_df,
+            )
+        except Exception:
+            forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
+    else:
+        forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
+
+    current_week_no = int(pd.Timestamp.today().isocalendar().week)
+    out, _pm, _bm, _fw = apply_forecast_and_inventory_to_compare_table(
+        compare_table_df, forecast_df, this_year, current_week_no
+    )
+    return out
 
 
 @st.cache_data(ttl=300)
@@ -1672,98 +1865,15 @@ def main():
                 "표는 주차 오름차순이며, 해당 행은 노란색으로 표시됩니다."
             )
 
-    forecast_week_map = {}
-    if not forecast_df.empty and "날짜" in forecast_df.columns and "forecast" in forecast_df.columns:
-        tmp_fc = forecast_df.dropna(subset=["날짜"]).copy()
-        if not tmp_fc.empty:
-            tmp_fc["year"] = tmp_fc["날짜"].dt.isocalendar().year.astype(int)
-            tmp_fc = tmp_fc[tmp_fc["year"] == this_year].copy()
-            if not tmp_fc.empty:
-                tmp_fc["week_no"] = tmp_fc["날짜"].dt.isocalendar().week.astype(int)
-                tmp_fc["forecast"] = pd.to_numeric(tmp_fc["forecast"], errors="coerce").fillna(0)
-                forecast_week_map = (
-                    tmp_fc.groupby("week_no")["forecast"].sum().round().astype(int).to_dict()
-                )
-
-    compare_table_df = compare_table_df.copy()
-    compare_table_df = compare_table_df.sort_values("week_no", ascending=True, kind="mergesort").reset_index(drop=True)
-
-    is_future_week = compare_table_df["week_no"].astype(int) > current_week_no
-    has_forecast = compare_table_df["week_no"].astype(int).map(lambda w: w in forecast_week_map)
-    predict_mask = is_future_week & has_forecast
-
-    if predict_mask.any():
-        compare_table_df.loc[predict_mask, "올해 해당 주차 판매량 (장)"] = (
-            compare_table_df.loc[predict_mask, "week_no"].astype(int).map(forecast_week_map).fillna(0).astype(int)
-        )
-
-    # -----------------------------
-    # 미래 주차 기초재고 예측
-    # 기초재고(t) = 기초재고(t-1) - 판매량(t-1) + 분배량(t-1) - 출고량(t-1)
-    # -----------------------------
-
-    for col in ["기초재고", "올해 해당 주차 판매량 (장)", "분배량", "출고량(회전 등)"]:
-        if col not in compare_table_df.columns:
-            compare_table_df[col] = 0
-        compare_table_df[col] = pd.to_numeric(compare_table_df[col], errors="coerce").fillna(0).astype(int)
-
-    # 기초재고 롤링 계산
-    # - 실측 기초재고가 있으면 그 주차 값은 존중(현재 주차 이하 + 값이 0이 아닌 경우)
-    # - 없으면 첫 주차는 현재 값(대개 0)에서 시작해, 규칙대로 모든 주차를 순차 계산
-    base_pred_mask = pd.Series(False, index=compare_table_df.index)
-    week_list = compare_table_df["week_no"].astype(int).tolist()
-
-    for i in range(1, len(week_list)):
-        w_cur = int(week_list[i])
-
-        # 실측 기초재고가 있는 주차는 덮어쓰지 않음(0이 아닌 경우만)
-        observed_base = int(compare_table_df.loc[i, "기초재고"])
-        if (w_cur <= current_week_no) and (observed_base != 0):
-            continue
-
-        prev_base = int(compare_table_df.loc[i - 1, "기초재고"])
-        prev_sales = int(compare_table_df.loc[i - 1, "올해 해당 주차 판매량 (장)"])
-        prev_dist = int(compare_table_df.loc[i - 1, "분배량"])
-        prev_ship = int(compare_table_df.loc[i - 1, "출고량(회전 등)"])
-
-        predicted_base = prev_base - prev_sales + prev_dist - prev_ship
-        compare_table_df.loc[i, "기초재고"] = int(predicted_base)
-
-        if w_cur > current_week_no:
-            base_pred_mask.iloc[i] = True
-
-    # 기초재고는 음수일 수 없음(표시는 0). 롤링·로스 판단은 클립 전 값(base_raw) 사용.
+    (
+        compare_table_df,
+        predict_mask,
+        base_pred_mask,
+        is_future_week,
+    ) = apply_forecast_and_inventory_to_compare_table(
+        compare_table_df, forecast_df, this_year, current_week_no
+    )
     sales_col = "올해 해당 주차 판매량 (장)"
-    base_raw = compare_table_df["기초재고"].astype(int).copy()
-    compare_table_df["기초재고"] = np.maximum(base_raw, 0).astype(int)
-
-    # -----------------------------
-    # 로스 계산 (미래 주차 예측 전용)
-    # - 지난·현재 주차(week_no <= current_week_no): 항상 0 (실적 구간에는 표시 안 함)
-    # - 미래 주차만: 기초재고(raw) 기반 예측 로스 누적
-    #   - raw > 0 & raw < 판매: 로스 = raw - 판매
-    #   - raw <= 0: 로스 = 지난주 로스 - 이번주 판매
-    # -----------------------------
-    n_rows = len(compare_table_df)
-    loss_vals = []
-    prev_loss = 0
-    for i in range(n_rows):
-        w = int(compare_table_df.loc[i, "week_no"])
-        if w <= current_week_no:
-            loss_vals.append(0)
-            continue
-
-        raw_b = int(base_raw.iloc[i])
-        sales = int(compare_table_df.loc[i, sales_col])
-        if raw_b <= 0:
-            cur_loss = prev_loss - sales
-        elif raw_b < sales:
-            cur_loss = raw_b - sales
-        else:
-            cur_loss = 0
-        prev_loss = cur_loss
-        loss_vals.append(cur_loss)
-    compare_table_df["로스"] = loss_vals
 
     if lead_days is None:
         reorder_top_message.info(
@@ -1816,13 +1926,24 @@ def main():
     except Exception:
         extras_on = False
 
-    web_run_supabase = st.button(
-        "실행 · 현재 표를 Supabase에 저장",
-        type="primary",
-        use_container_width=True,
-        key="web_run_supabase_sync",
-        help="클릭 시 위에서 선택한 SKU·매장의 주차 비교표가 sku_weekly_forecast 테이블에 반영됩니다.",
-    )
+    sync_cols = st.columns(2)
+    with sync_cols[0]:
+        web_run_supabase = st.button(
+            "실행 · 현재 표를 Supabase에 저장",
+            type="primary",
+            use_container_width=True,
+            key="web_run_supabase_sync",
+            help="클릭 시 위에서 선택한 SKU·매장의 주차 비교표가 sku_weekly_forecast 테이블에 반영됩니다.",
+        )
+    with sync_cols[1]:
+        web_run_supabase_all = st.button(
+            "전체 시트 → Supabase 일괄 저장",
+            type="primary",
+            use_container_width=True,
+            key="web_run_supabase_sync_all",
+            help="구글 시트 final의 모든 매장·SKU 조합을 계산해 테이블을 비운 뒤 한 번에 저장합니다. "
+            "형태 분류는 로직만 사용(OpenAI 호출 없음). 미래 주차는 작년 비중 예측(forecast_with_gpt 규칙)을 적용합니다.",
+        )
 
     if web_run_supabase:
         if _create_supabase_client is None:
@@ -1855,6 +1976,76 @@ def main():
             except Exception as e:
                 st.session_state["supabase_sync_feedback"] = ("error", f"실행 실패: {e}")
 
+    if web_run_supabase_all:
+        if _create_supabase_client is None:
+            st.session_state["supabase_sync_feedback"] = (
+                "error",
+                "Supabase 연동을 위해 `pip install supabase` 를 설치한 뒤 앱을 다시 실행하세요.",
+            )
+        elif sb_client is None:
+            st.session_state["supabase_sync_feedback"] = (
+                "error",
+                "Supabase 연결 정보가 없습니다. secrets.toml에 [supabase] url·service_role_key를 설정하세요.",
+            )
+        else:
+            try:
+                all_rows: List[Dict[str, Any]] = []
+                skipped_notes: List[str] = []
+                success_combos = 0
+                for _, opt in options_df.iterrows():
+                    plant_db = str(opt.get("plant_name", "")).strip() or "전체"
+                    sku_v = str(opt.get("sku", "")).strip()
+                    if not sku_v:
+                        skipped_notes.append(f"(빈 SKU) / {plant_db}")
+                        continue
+                    pf = plant_db if plant_db != "전체" else "전체"
+                    ct = build_compare_table_for_final_option(
+                        plc_df,
+                        final_prepared,
+                        selected_sku=sku_v,
+                        selected_sku_name=str(opt.get("sku_name", "")).strip(),
+                        selected_item_code=str(opt.get("item_code", "")).strip(),
+                        selected_plant=plant_db,
+                        this_year=this_year,
+                        use_openai_shape=False,
+                        apply_ratio_forecast=True,
+                    )
+                    if ct is None or ct.empty:
+                        skipped_notes.append(f"{sku_v} / {plant_db} (plc db 매칭 실패 또는 표 없음)")
+                        continue
+                    rows_part = build_sku_weekly_forecast_rows(
+                        ct,
+                        sku_v,
+                        str(opt.get("sku_name", "")).strip(),
+                        str(opt.get("style_code", "")).strip(),
+                        pf,
+                        plant_db if plant_db != "전체" else pf,
+                        avg_discount_rat=None,
+                        persist_compare_extras=extras_on,
+                    )
+                    if not rows_part:
+                        skipped_notes.append(f"{sku_v} / {plant_db} (저장할 행 없음)")
+                        continue
+                    all_rows.extend(rows_part)
+                    success_combos += 1
+
+                clear_sku_weekly_forecast_table(sb_client)
+                bulk_insert_sku_weekly_forecast_rows(sb_client, all_rows)
+                st.session_state.pop("supabase_full_sync_skipped", None)
+                skip_tail = ""
+                if skipped_notes:
+                    preview = skipped_notes[:25]
+                    st.session_state["supabase_full_sync_skipped"] = preview + (
+                        [f"... 외 {len(skipped_notes) - 25}건"] if len(skipped_notes) > 25 else []
+                    )
+                    skip_tail = f" 건너뜀 {len(skipped_notes)}건(plc 미매칭 등)."
+                st.session_state["supabase_sync_feedback"] = (
+                    "success",
+                    f"일괄 저장 완료: 총 {len(all_rows)}행, 조합 {success_combos}개 / 시트 후보 {len(options_df)}개.{skip_tail}",
+                )
+            except Exception as e:
+                st.session_state["supabase_sync_feedback"] = ("error", f"일괄 저장 실패: {e}")
+
     fb = st.session_state.get("supabase_sync_feedback")
     if fb:
         kind, text = fb
@@ -1863,10 +2054,18 @@ def main():
         else:
             st.error(text)
 
+    skipped_full = st.session_state.get("supabase_full_sync_skipped")
+    if skipped_full:
+        with st.expander("일괄 저장에서 건너뛴 조합 (plc db에 아이템코드 없음 등)"):
+            for line in skipped_full:
+                st.text(line)
+
     with st.expander("Supabase 저장 안내 (`sku_weekly_forecast`)"):
         st.markdown(
-            "표 바로 위의 **실행** 버튼을 누르면, 구글 시트로 계산된 현재 주차별 표가 DB에 반영됩니다. "
-            "같은 SKU·plant 조합의 기존 행은 삭제 후 다시 넣습니다."
+            "왼쪽 **실행** 버튼: 화면에서 선택한 SKU·매장의 주차 표만 저장합니다. "
+            "같은 SKU·plant 조합의 기존 행은 삭제 후 다시 넣습니다. "
+            "오른쪽 **전체 시트 일괄 저장**은 final 시트에 나온 **모든 매장·SKU 조합**을 계산해 "
+            "`sku_weekly_forecast` 테이블을 **비운 뒤** 한 번에 다시 채웁니다(이전 DB에만 있던 행은 사라집니다)."
         )
         if _create_supabase_client is None:
             st.warning("패키지: `pip install supabase`")
