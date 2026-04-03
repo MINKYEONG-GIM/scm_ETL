@@ -546,6 +546,91 @@ def sync_sku_weekly_forecast_to_supabase(
     tbl.insert(rows).execute()
 
 
+def peak_week_month_from_weekly_df(weekly_df: pd.DataFrame) -> Tuple[Optional[int], Optional[int]]:
+    """
+    작년(PLC) 주차별 판매 시계열에서 판매량이 가장 큰 주의 ISO 주차·월(1~12)을 반환합니다.
+    """
+    if weekly_df is None or weekly_df.empty:
+        return None, None
+    if "week_start" not in weekly_df.columns or "sales" not in weekly_df.columns:
+        return None, None
+    df = weekly_df.dropna(subset=["week_start"]).copy()
+    if df.empty:
+        return None, None
+    sales = pd.to_numeric(df["sales"], errors="coerce").fillna(0.0)
+    idx = int(sales.values.argmax())
+    ts = df.iloc[idx]["week_start"]
+    if pd.isna(ts):
+        return None, None
+    try:
+        peak_week = int(pd.Timestamp(ts).isocalendar().week)
+        peak_month = int(pd.Timestamp(ts).month)
+        return peak_week, peak_month
+    except Exception:
+        return None, None
+
+
+def build_sku_forecast_run_payload(
+    *,
+    sku: str,
+    sku_name: str,
+    style_code: str,
+    plant: str,
+    store_name: str,
+    shape_type: str,
+    peak_week: Optional[int],
+    peak_month: Optional[int],
+) -> Dict[str, Any]:
+    """
+    Supabase 테이블 sku_forecast_run 행 1건.
+    대시보드에 SKU로 보여도 DB/API 컬럼은 보통 소문자 sku입니다.
+    """
+    sku_s = str(sku).strip()
+    plant_s = str(plant).strip() if plant else "전체"
+    rec: Dict[str, Any] = {
+        "sku": sku_s,
+        "sku_name": str(sku_name).strip(),
+        "style_code": (str(style_code).strip() if style_code is not None else "") or None,
+        "plant": plant_s,
+        "store_name": str(store_name).strip() if store_name else plant_s,
+        "shape_type": (str(shape_type).strip() if shape_type else "") or None,
+        "peak_week": int(peak_week) if peak_week is not None else None,
+        "peak_month": int(peak_month) if peak_month is not None else None,
+    }
+    return rec
+
+
+def sync_sku_forecast_run_to_supabase(
+    client,
+    payload: Dict[str, Any],
+    sku: str,
+    plant: str,
+) -> None:
+    """동일 SKU·plant의 sku_forecast_run 기존 행을 지우고 1건 삽입합니다."""
+    sku_s = str(sku).strip()
+    plant_s = str(plant).strip() if plant else "전체"
+    tbl = client.table("sku_forecast_run")
+    tbl.delete().eq("sku", sku_s).eq("plant", plant_s).execute()
+    tbl.insert(payload).execute()
+
+
+def clear_sku_forecast_run_table(client) -> None:
+    sentinel = "\uffff\uffff__never_match_sku__\uffff\uffff"
+    client.table("sku_forecast_run").delete().neq("sku", sentinel).execute()
+
+
+def bulk_insert_sku_forecast_run_rows(
+    client,
+    rows: List[Dict[str, Any]],
+    batch_size: int = 200,
+) -> None:
+    if not rows:
+        return
+    tbl = client.table("sku_forecast_run")
+    for i in range(0, len(rows), batch_size):
+        tbl.insert(rows[i : i + batch_size]).execute()
+
+
 def clear_sku_weekly_forecast_table(client) -> None:
     """
     sku_weekly_forecast 전체 비우기. PostgREST는 무조건 필터가 필요해
@@ -667,10 +752,11 @@ def build_compare_table_for_final_option(
     this_year: int,
     use_openai_shape: bool,
     apply_ratio_forecast: bool,
-) -> Optional[pd.DataFrame]:
+) -> Optional[Tuple[pd.DataFrame, str, Optional[int], Optional[int]]]:
     """
     final 시트의 (매장, SKU) 한 조합에 대해 주차 비교표를 계산합니다.
     plc db에 아이템코드가 없으면 None.
+    반환: (비교표, shape_type 라벨, peak_week ISO, peak_month 1~12)
     """
     sku_key = str(selected_sku).strip()
     plant_key = str(selected_plant).strip() if selected_plant else "전체"
@@ -714,11 +800,13 @@ def build_compare_table_for_final_option(
     else:
         forecast_df = pd.DataFrame(columns=["날짜", "forecast"])
 
+    peak_w, peak_m = peak_week_month_from_weekly_df(weekly_df)
+
     current_week_no = int(pd.Timestamp.today().isocalendar().week)
     out, _pm, _bm, _fw = apply_forecast_and_inventory_to_compare_table(
         compare_table_df, forecast_df, this_year, current_week_no
     )
-    return out
+    return out, shape_label, peak_w, peak_m
 
 
 @st.cache_data(ttl=300)
@@ -1933,7 +2021,7 @@ def main():
             type="primary",
             use_container_width=True,
             key="web_run_supabase_sync",
-            help="클릭 시 위에서 선택한 SKU·매장의 주차 비교표가 sku_weekly_forecast 테이블에 반영됩니다.",
+            help="선택한 SKU·매장의 주차 표는 sku_weekly_forecast에, 형태(단봉형 등)·피크 주차/월은 sku_forecast_run에 저장됩니다.",
         )
     with sync_cols[1]:
         web_run_supabase_all = st.button(
@@ -1941,8 +2029,8 @@ def main():
             type="primary",
             use_container_width=True,
             key="web_run_supabase_sync_all",
-            help="구글 시트 final의 모든 매장·SKU 조합을 계산해 테이블을 비운 뒤 한 번에 저장합니다. "
-            "형태 분류는 로직만 사용(OpenAI 호출 없음). 미래 주차는 작년 비중 예측(forecast_with_gpt 규칙)을 적용합니다.",
+            help="final 시트 전 조합에 대해 sku_weekly_forecast와 sku_forecast_run을 비운 뒤 함께 채웁니다. "
+            "형태 분류는 로직만(OpenAI 없음). 미래 주차는 작년 비중 예측 규칙을 적용합니다.",
         )
 
     if web_run_supabase:
@@ -1969,9 +2057,24 @@ def main():
                     persist_compare_extras=extras_on,
                 )
                 sync_sku_weekly_forecast_to_supabase(sb_client, rows, selected_sku, plant_for_db)
+                pw, pm = peak_week_month_from_weekly_df(weekly_df)
+                run_payload = build_sku_forecast_run_payload(
+                    sku=selected_sku,
+                    sku_name=selected_sku_name,
+                    style_code=str(selected_row["style_code"]).strip(),
+                    plant=plant_for_db,
+                    store_name=store_for_db,
+                    shape_type=shape_label,
+                    peak_week=pw,
+                    peak_month=pm,
+                )
+                sync_sku_forecast_run_to_supabase(
+                    sb_client, run_payload, selected_sku, plant_for_db
+                )
                 st.session_state["supabase_sync_feedback"] = (
                     "success",
-                    f"실행 완료: {len(rows)}행 저장됨 (sku={selected_sku}, plant={plant_for_db}).",
+                    f"실행 완료: sku_weekly_forecast {len(rows)}행 + sku_forecast_run 1건 "
+                    f"(sku={selected_sku}, plant={plant_for_db}, 형태={shape_label}).",
                 )
             except Exception as e:
                 st.session_state["supabase_sync_feedback"] = ("error", f"실행 실패: {e}")
@@ -1990,6 +2093,7 @@ def main():
         else:
             try:
                 all_rows: List[Dict[str, Any]] = []
+                all_run_rows: List[Dict[str, Any]] = []
                 skipped_notes: List[str] = []
                 success_combos = 0
                 for _, opt in options_df.iterrows():
@@ -1999,7 +2103,7 @@ def main():
                         skipped_notes.append(f"(빈 SKU) / {plant_db}")
                         continue
                     pf = plant_db if plant_db != "전체" else "전체"
-                    ct = build_compare_table_for_final_option(
+                    built = build_compare_table_for_final_option(
                         plc_df,
                         final_prepared,
                         selected_sku=sku_v,
@@ -2010,8 +2114,12 @@ def main():
                         use_openai_shape=False,
                         apply_ratio_forecast=True,
                     )
-                    if ct is None or ct.empty:
+                    if built is None:
                         skipped_notes.append(f"{sku_v} / {plant_db} (plc db 매칭 실패 또는 표 없음)")
+                        continue
+                    ct, shape_lbl, peak_w, peak_m = built
+                    if ct.empty:
+                        skipped_notes.append(f"{sku_v} / {plant_db} (표 없음)")
                         continue
                     rows_part = build_sku_weekly_forecast_rows(
                         ct,
@@ -2027,10 +2135,24 @@ def main():
                         skipped_notes.append(f"{sku_v} / {plant_db} (저장할 행 없음)")
                         continue
                     all_rows.extend(rows_part)
+                    all_run_rows.append(
+                        build_sku_forecast_run_payload(
+                            sku=sku_v,
+                            sku_name=str(opt.get("sku_name", "")).strip(),
+                            style_code=str(opt.get("style_code", "")).strip(),
+                            plant=pf,
+                            store_name=plant_db if plant_db != "전체" else pf,
+                            shape_type=shape_lbl,
+                            peak_week=peak_w,
+                            peak_month=peak_m,
+                        )
+                    )
                     success_combos += 1
 
                 clear_sku_weekly_forecast_table(sb_client)
                 bulk_insert_sku_weekly_forecast_rows(sb_client, all_rows)
+                clear_sku_forecast_run_table(sb_client)
+                bulk_insert_sku_forecast_run_rows(sb_client, all_run_rows)
                 st.session_state.pop("supabase_full_sync_skipped", None)
                 skip_tail = ""
                 if skipped_notes:
@@ -2041,7 +2163,8 @@ def main():
                     skip_tail = f" 건너뜀 {len(skipped_notes)}건(plc 미매칭 등)."
                 st.session_state["supabase_sync_feedback"] = (
                     "success",
-                    f"일괄 저장 완료: 총 {len(all_rows)}행, 조합 {success_combos}개 / 시트 후보 {len(options_df)}개.{skip_tail}",
+                    f"일괄 저장 완료: sku_weekly_forecast {len(all_rows)}행, "
+                    f"sku_forecast_run {len(all_run_rows)}건, 조합 {success_combos}개 / 시트 후보 {len(options_df)}개.{skip_tail}",
                 )
             except Exception as e:
                 st.session_state["supabase_sync_feedback"] = ("error", f"일괄 저장 실패: {e}")
@@ -2060,12 +2183,12 @@ def main():
             for line in skipped_full:
                 st.text(line)
 
-    with st.expander("Supabase 저장 안내 (`sku_weekly_forecast`)"):
+    with st.expander("Supabase 저장 안내 (`sku_weekly_forecast` · `sku_forecast_run`)"):
         st.markdown(
-            "왼쪽 **실행** 버튼: 화면에서 선택한 SKU·매장의 주차 표만 저장합니다. "
-            "같은 SKU·plant 조합의 기존 행은 삭제 후 다시 넣습니다. "
-            "오른쪽 **전체 시트 일괄 저장**은 final 시트에 나온 **모든 매장·SKU 조합**을 계산해 "
-            "`sku_weekly_forecast` 테이블을 **비운 뒤** 한 번에 다시 채웁니다(이전 DB에만 있던 행은 사라집니다)."
+            "왼쪽 **실행**: 선택 SKU·매장의 주차별 표는 `sku_weekly_forecast`에, "
+            "그래프 형태(단봉형·쌍봉형·올시즌형 등)·판매 피크 ISO 주차·월은 `sku_forecast_run`에 각 1건 저장합니다. "
+            "같은 SKU·plant 조합은 두 테이블 모두에서 덮어씁니다. "
+            "오른쪽 **전체 시트 일괄 저장**은 final의 모든 조합에 대해 두 테이블을 **각각 비운 뒤** 다시 채웁니다."
         )
         if _create_supabase_client is None:
             st.warning("패키지: `pip install supabase`")
