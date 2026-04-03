@@ -478,8 +478,8 @@ def get_sku_forecast_run_sku_column_name() -> str:
     env_v = (os.getenv("SUPABASE_SKU_FORECAST_SKU_COLUMN") or "").strip()
     if env_v:
         return env_v
-    # Postgres 미인용 식별자는 소문자 저장 → PostgREST도 대개 `sku`. UI에만 SKU로 보일 수 있음.
-    return "sku"
+    # Supabase UI로 만든 "SKU" 컬럼은 DB에 대문자 식별자로 남는 경우가 많음(오류: sku does not exist).
+    return "SKU"
 
 
 def omit_none_values(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -666,7 +666,7 @@ def sync_sku_forecast_run_to_supabase(
             f"sku_forecast_run 저장 실패: {e!s}. "
             f"확인: (1) service_role_key로 RLS 우회 "
             f"(2) RLS 사용 시 sku_forecast_run에 INSERT·DELETE·SELECT 정책 "
-            f"(3) 컬럼명이 소문자 sku면 secrets에 sku_forecast_sku_column = \"sku\" "
+            f"(3) 컬럼이 소문자 sku면 secrets에 sku_forecast_sku_column = \"sku\" "
             f"(4) id에 identity/bigserial/default nextval 설정"
         ) from e
 
@@ -2263,7 +2263,7 @@ def main():
         st.caption(
             "`sku_forecast_run` 저장 실패 시: **service_role_key** 권장(RLS 우회). RLS 유지 시 INSERT·DELETE·SELECT 정책 필요. "
             "`id`는 identity/bigserial 권장. API 오류에 컬럼명이 나오면 secrets에 "
-            "`sku_forecast_sku_column = \"SKU\"` 또는 `\"sku\"` 로 맞추세요. (기본 `sku`)"
+            "`sku_forecast_sku_column = \"sku\"` 로 맞추세요. (기본 컬럼명은 `SKU`)"
         )
         if extras_on:
             st.caption(
